@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -28,7 +29,10 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        if "Qwen2_5_VLForConditionalGeneration" in hf_config.architectures:
+            self.model = Qwen2_5_VLForConditionalGeneration(hf_config)
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -132,6 +136,8 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        mm_inputs = {"pixel_values": [], "image_grid_thw": []}
+        has_multimodal = False
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
@@ -142,6 +148,12 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            if seq.mm_inputs:
+                has_multimodal = True
+                if "pixel_values" in seq.mm_inputs and seq.mm_inputs["pixel_values"] is not None:
+                    mm_inputs["pixel_values"].append(seq.mm_inputs["pixel_values"])
+                if "image_grid_thw" in seq.mm_inputs and seq.mm_inputs["image_grid_thw"] is not None:
+                    mm_inputs["image_grid_thw"].append(seq.mm_inputs["image_grid_thw"])
             if not seq.block_table:    # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
@@ -153,13 +165,23 @@ class ModelRunner:
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+
+        if has_multimodal:
+            for key in ["pixel_values", "image_grid_thw"]:
+                if mm_inputs[key]:
+                    mm_inputs[key] = torch.cat(mm_inputs[key], dim=0).cuda(non_blocking=True)
+                else:
+                    mm_inputs.pop(key, None)
+        else:
+            mm_inputs = None
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
-        return input_ids, positions
+        return input_ids, positions, mm_inputs
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
@@ -187,9 +209,12 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, mm_inputs: dict = None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            kwargs = {}
+            if mm_inputs:
+                kwargs.update(mm_inputs)
+            return self.model.compute_logits(self.model(input_ids, positions, **kwargs))
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -206,9 +231,13 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        if is_prefill:
+            input_ids, positions, mm_inputs = self.prepare_prefill(seqs)
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+            mm_inputs = None
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions, is_prefill, mm_inputs)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

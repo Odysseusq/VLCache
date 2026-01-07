@@ -15,7 +15,7 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), mm_inputs: dict = None):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -27,6 +27,7 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.mm_inputs = mm_inputs
 
     def __len__(self):
         return self.num_tokens
@@ -73,11 +74,13 @@ class Sequence:
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+                self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+                self.mm_inputs)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-2]
         if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
+            self.token_ids = state[-2]
         else:
-            self.last_token = state[-1]
+            self.last_token = state[-2]
+        self.mm_inputs = state[-1]
