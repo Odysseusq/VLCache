@@ -2,6 +2,15 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2512.12977-b31b1b.svg)](https://arxiv.org/abs/2512.12977)
 
+> [!IMPORTANT]
+> 🚀 **For the production-ready and fully optimized implementation** (which supports high-concurrency serving), please refer to our official release in SGLang:
+>
+> 👉 **[ibifrost/VLCache](https://github.com/ibifrost/VLCache)**
+>
+> **This repository is a minimalist implementation (Proof of Concept) based on nanovllm to demonstrate the core algorithm of our paper.**
+>
+> *We strongly recommend using the SGLang version for performance benchmarking and deployment.*
+
 **Official repository for "VLCache: Computing 2% Vision Tokens and Reusing 98% for Vision-Language Inference".**
 
 This repository provides a **nanovllm-based implementation** of VLCache, demonstrating efficient KV cache reuse and acceleration for Vision-Language Models. This implementation is specifically optimized for **Qwen2.5-VL**.
@@ -14,7 +23,6 @@ Processing high-resolution images in Vision-Language Models (VLMs) incurs signif
 
 ## 🌟 Key Features
 
-- **Built for Qwen2.5-VL**: Tailored optimizations for the Qwen2.5-VL architecture.
 - **Position-Agnostic Reuse**: Overcomes the limitation where varying image positions and contexts prevent direct KV cache reuse.
 - **Dynamic Recomputation**: Combines cache reuse with a strategic recomputation policy to eliminate cumulative reuse errors.
 - **Theoretical Foundation**: Formally identifies "Reuse Error" propagation and determines the optimal layers for recomputation, outperforming heuristic methods like CacheBlend and EPIC.
@@ -30,30 +38,10 @@ Processing high-resolution images in Vision-Language Models (VLMs) incurs signif
 
 ## 🛠️ Implementation
 
-This codebase implements the VLCache mechanism on top of **nanovllm**, a lightweight LLM inference engine. It demonstrates:
+The primary and production-ready implementation of VLCache is built on **SGLang**. This repository provides a simplified **nanovllm**-based reference implementation to demonstrate the core algorithms:
 - KV Cache reuse logic for vision tokens.
 - Dynamic recomputation strategies.
 - Integration with Qwen2.5-VL models.
-
-## 📦 Installation
-
-```bash
-git clone https://github.com/VLCache/VLCache.git
-cd VLCache
-pip install -e .
-```
-
-## ⚡ Quick Start
-
-See `example.py` for usage.
-
-## 📊 Benchmark
-
-See `bench.py` for benchmark scripts.
-
-```bash
-python bench.py
-```
 
 ## 🔗 Citation
 
