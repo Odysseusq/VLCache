@@ -58,7 +58,7 @@ class BlockManager:
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
-        h = -1
+        h = seq.image_hash if seq.image_hash is not None else -1
         cache_miss = False
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
@@ -104,7 +104,10 @@ class BlockManager:
         elif len(seq) % self.block_size == 0:
             assert last_block.hash == -1
             token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+            if len(block_table) > 1:
+                prefix = self.blocks[block_table[-2]].hash
+            else:
+                prefix = seq.image_hash if seq.image_hash is not None else -1
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
             self.hash_to_block_id[h] = last_block.block_id

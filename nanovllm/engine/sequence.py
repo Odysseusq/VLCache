@@ -16,7 +16,7 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), mm_inputs: dict = None):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), mm_inputs: dict = None, image_hashes: list[int] = None):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -29,6 +29,7 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.mm_inputs = mm_inputs
+        self.image_hashes = image_hashes
         
         # Timing metrics
         self.start_time = time.time()
@@ -73,6 +74,15 @@ class Sequence:
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
+    @property
+    def image_hash(self):
+        if not self.image_hashes:
+            return None
+        h = 0
+        for x in self.image_hashes:
+            h ^= x
+        return h
+
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
@@ -81,17 +91,21 @@ class Sequence:
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token,
-                self.mm_inputs, self.start_time, self.vit_time, self.ttft)
+                self.mm_inputs, self.start_time, self.vit_time, self.ttft, self.image_hashes)
 
     def __setstate__(self, state):
-        if len(state) == 9:
+        if len(state) == 10:
+            self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft, self.image_hashes = state
+        elif len(state) == 9:
             self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft = state
+            self.image_hashes = None
         else:
             # Backward compatibility
             self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs = state
             self.start_time = time.time()
             self.vit_time = 0.0
             self.ttft = 0.0
+            self.image_hashes = None
 
         if self.num_completion_tokens == 0:
             self.token_ids = token_data

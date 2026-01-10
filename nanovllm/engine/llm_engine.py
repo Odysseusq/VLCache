@@ -3,11 +3,13 @@ from dataclasses import fields
 from time import perf_counter, time
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.encoder_cache_manager import EncoderCacheManager
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
@@ -40,9 +42,17 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams, mm_inputs: dict = None):
+        image_hashes = None
+        if mm_inputs:
+            pixel_values = mm_inputs.get("pixel_values")
+            grid_thw = mm_inputs.get("image_grid_thw")
+            if pixel_values is not None and grid_thw is not None:
+                img_lens = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).tolist()
+                pixel_values_list = torch.split(pixel_values, img_lens)
+                image_hashes = [EncoderCacheManager.compute_hash(pv, g_thw) for pv, g_thw in zip(pixel_values_list, grid_thw)]
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params, mm_inputs)
+        seq = Sequence(prompt, sampling_params, mm_inputs, image_hashes)
         self.scheduler.add(seq)
 
     def step(self):

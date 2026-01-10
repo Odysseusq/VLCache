@@ -151,7 +151,7 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
-        mm_inputs = {"pixel_values": [], "image_grid_thw": []}
+        mm_inputs = {"pixel_values": [], "image_grid_thw": [], "image_hashes": []}
         has_multimodal = False
         for seq in seqs:
             seqlen = len(seq)
@@ -165,10 +165,26 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if seq.mm_inputs:
                 has_multimodal = True
-                if "pixel_values" in seq.mm_inputs and seq.mm_inputs["pixel_values"] is not None:
-                    mm_inputs["pixel_values"].append(seq.mm_inputs["pixel_values"])
-                if "image_grid_thw" in seq.mm_inputs and seq.mm_inputs["image_grid_thw"] is not None:
-                    mm_inputs["image_grid_thw"].append(seq.mm_inputs["image_grid_thw"])
+                image_token_id = getattr(self.model.config, "image_token_id", 151655)
+                num_cached_images = seq.token_ids[:seq.num_cached_tokens].count(image_token_id)
+                pv = seq.mm_inputs.get("pixel_values")
+                g_thw = seq.mm_inputs.get("image_grid_thw")
+                hashes = seq.image_hashes
+                if num_cached_images > 0:
+                    if g_thw is not None:
+                        img_lens = (g_thw[:, 0] * g_thw[:, 1] * g_thw[:, 2]).tolist()
+                        pv_offset = sum(img_lens[:num_cached_images])
+                        if pv is not None:
+                            pv = pv[pv_offset:]
+                        g_thw = g_thw[num_cached_images:]
+                    if hashes:
+                        hashes = hashes[num_cached_images:]
+                if pv is not None:
+                    mm_inputs["pixel_values"].append(pv)
+                if g_thw is not None:
+                    mm_inputs["image_grid_thw"].append(g_thw)
+                if hashes:
+                    mm_inputs["image_hashes"].extend(hashes)
             if not seq.block_table:    # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
@@ -226,6 +242,8 @@ class ModelRunner:
     @torch.inference_mode()
     def _process_visual_cache(self, mm_inputs: dict) -> tuple[torch.Tensor, float]:
         pixel_values = mm_inputs["pixel_values"]
+        if pixel_values.numel() == 0:
+            return None, 0.0
         grid_thw = mm_inputs["image_grid_thw"]
         img_lens = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).tolist()
         pixel_values_list = torch.split(pixel_values, img_lens)
@@ -237,8 +255,9 @@ class ModelRunner:
         miss_out_lens = []
         vit_time = 0.0
         spatial_merge_size = self.model.visual.spatial_merge_size
+        image_hashes = mm_inputs.get("image_hashes")
         for i, (pv, g_thw) in enumerate(zip(pixel_values_list, grid_thw)):
-            h = EncoderCacheManager.compute_hash(pv, g_thw)
+            h = image_hashes[i]
             t, height, width = g_thw.tolist()
             out_h = height // spatial_merge_size
             out_w = width // spatial_merge_size

@@ -574,7 +574,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             image_mask = (input_ids == image_token_id)
             
             # Verify shapes matches
-            assert image_mask.sum() == visual_embeds.shape[0], f"Shape mismatch: {image_mask.sum()} vs {visual_embeds}"
+            assert image_mask.sum() == visual_embeds.shape[0], f"Shape mismatch: {image_mask.sum()} vs {visual_embeds.shape[0]}"
             inputs_embeds[image_mask] = visual_embeds.to(inputs_embeds.dtype)
             
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
