@@ -1,4 +1,5 @@
 import pickle
+from time import perf_counter
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -6,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.encoder_cache_manager import EncoderCacheManager
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from nanovllm.layers.sampler import Sampler
@@ -110,8 +112,21 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        kv_block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        encoder_block_bytes = self.block_size * hf_config.hidden_size * hf_config.torch_dtype.itemsize
+        available_memory = total * config.gpu_memory_utilization - used - peak + current
+        encoder_memory = available_memory * config.encoder_cache_ratio
+        kv_memory = available_memory - encoder_memory
+        num_encoder_blocks = int(encoder_memory) // encoder_block_bytes
+        assert num_encoder_blocks > 0
+        self.encoder_cache_manager = EncoderCacheManager(
+            num_encoder_blocks, 
+            self.block_size, 
+            hf_config.hidden_size, 
+            hf_config.torch_dtype, 
+            device="cuda"
+        )
+        config.num_kvcache_blocks = int(kv_memory) // kv_block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
@@ -209,12 +224,65 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
+    def _process_visual_cache(self, mm_inputs: dict) -> tuple[torch.Tensor, float]:
+        pixel_values = mm_inputs["pixel_values"]
+        grid_thw = mm_inputs["image_grid_thw"]
+        img_lens = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).tolist()
+        pixel_values_list = torch.split(pixel_values, img_lens)
+        image_embeds_list = [None] * len(img_lens)
+        miss_indices = []
+        miss_pixel_values_list = []
+        miss_grid_thw_list = []
+        miss_hashes = []
+        miss_out_lens = []
+        vit_time = 0.0
+        spatial_merge_size = self.model.visual.spatial_merge_size
+        for i, (pv, g_thw) in enumerate(zip(pixel_values_list, grid_thw)):
+            h = EncoderCacheManager.compute_hash(pv, g_thw)
+            t, height, width = g_thw.tolist()
+            out_h = height // spatial_merge_size
+            out_w = width // spatial_merge_size
+            output_len = t * out_h * out_w
+            block_ids = self.encoder_cache_manager.get_block_ids(h)
+            if block_ids:
+                image_embeds_list[i] = self.encoder_cache_manager.read(block_ids, output_len)
+            else:
+                miss_indices.append(i)
+                miss_pixel_values_list.append(pv)
+                miss_grid_thw_list.append(g_thw)
+                miss_hashes.append(h)
+                miss_out_lens.append(output_len)
+
+        if miss_indices:
+            miss_pv = torch.cat(miss_pixel_values_list, dim=0)
+            miss_g = torch.stack(miss_grid_thw_list, dim=0)
+            torch.cuda.synchronize()
+            st = perf_counter()
+            miss_embeds = self.model.get_visual_features(miss_pv, miss_g)
+            torch.cuda.synchronize()
+            vit_time = perf_counter() - st
+            miss_embeds_split = torch.split(miss_embeds, miss_out_lens)
+            for i, idx in enumerate(miss_indices):
+                emb = miss_embeds_split[i]
+                image_embeds_list[idx] = emb
+                h = miss_hashes[i]
+                out_len = miss_out_lens[i]
+                if self.encoder_cache_manager.can_allocate(out_len):
+                    block_ids = self.encoder_cache_manager.allocate(h, out_len)
+                    self.encoder_cache_manager.write(block_ids, emb)
+        return torch.cat(image_embeds_list, dim=0), vit_time
+
+    @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, mm_inputs: dict = None):
+        visual_embeds = None
+        vit_time = 0.0
+        if is_prefill and mm_inputs:
+            visual_embeds, vit_time = self._process_visual_cache(mm_inputs)
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            kwargs = {}
-            if mm_inputs:
-                kwargs.update(mm_inputs)
-            return self.model.compute_logits(self.model(input_ids, positions, **kwargs))
+            hidden_states = self.model(input_ids, positions, visual_embeds)
+            if visual_embeds is None:
+                vit_time = getattr(self.model, "last_vit_time", 0.0)
+            return self.model.compute_logits(hidden_states), vit_time
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -228,19 +296,19 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return self.model.compute_logits(graph_vars["outputs"][:bs]), 0.0
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> tuple[list[int], float]:
         if is_prefill:
             input_ids, positions, mm_inputs = self.prepare_prefill(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs)
             mm_inputs = None
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill, mm_inputs)
+        logits, vit_time = self.run_model(input_ids, positions, is_prefill, mm_inputs)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
-        return token_ids
+        return token_ids, vit_time
 
     @torch.inference_mode()
     def capture_cudagraph(self):

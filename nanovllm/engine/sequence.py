@@ -1,6 +1,7 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+import time
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -28,6 +29,11 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.mm_inputs = mm_inputs
+        
+        # Timing metrics
+        self.start_time = time.time()
+        self.vit_time = 0.0
+        self.ttft = 0.0
 
     def __len__(self):
         return self.num_tokens
@@ -75,12 +81,19 @@ class Sequence:
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token,
-                self.mm_inputs)
+                self.mm_inputs, self.start_time, self.vit_time, self.ttft)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-2]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-2]
+        if len(state) == 9:
+            self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft = state
         else:
-            self.last_token = state[-2]
-        self.mm_inputs = state[-1]
+            # Backward compatibility
+            self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs = state
+            self.start_time = time.time()
+            self.vit_time = 0.0
+            self.ttft = 0.0
+
+        if self.num_completion_tokens == 0:
+            self.token_ids = token_data
+        else:
+            self.last_token = token_data

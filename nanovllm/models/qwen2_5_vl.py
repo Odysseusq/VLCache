@@ -563,14 +563,12 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        pixel_values: torch.Tensor | None = None,
-        image_grid_thw: torch.Tensor | None = None,
+        visual_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Get input embeddings from LLM
         inputs_embeds = self.model.embed_tokens(input_ids)
         
-        if pixel_values is not None:
-            visual_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if visual_embeds is not None:
             # Fill in visual embeddings
             image_token_id = getattr(self.config, "image_token_id", 151655)
             image_mask = (input_ids == image_token_id)

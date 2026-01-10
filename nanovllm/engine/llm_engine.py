@@ -1,6 +1,6 @@
 import atexit
 from dataclasses import fields
-from time import perf_counter
+from time import perf_counter, time
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
@@ -47,9 +47,15 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        token_ids, vit_time = self.model_runner.call("run", seqs, is_prefill)
+        if is_prefill:
+            now = time()
+            for seq in seqs:
+                if seq.mm_inputs:
+                    seq.vit_time = vit_time
+                seq.ttft = now - seq.start_time
         self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [seq for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 
@@ -85,12 +91,17 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq in output:
+                outputs[seq.seq_id] = seq
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [{
+            "text": self.tokenizer.decode(seq.completion_token_ids),
+            "token_ids": seq.completion_token_ids,
+            "vit_time": seq.vit_time,
+            "ttft": seq.ttft,
+        } for seq in outputs]
         if use_tqdm:
             pbar.close()
         return outputs
