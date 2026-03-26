@@ -11,7 +11,12 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.image_token_id = getattr(config.hf_config, "image_token_id", 151655)
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            recompute_ratio=config.recompute_ratio,
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -32,7 +37,15 @@ class Scheduler:
                 break
             num_seqs += 1
             self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
+            self.block_manager.try_partial_recompute(seq, self.image_token_id)
+            # Token budget: skip reused image tokens if partial recompute
+            if seq.is_partial_recompute:
+                img_start, img_end = seq.image_token_range
+                N = img_end - img_start
+                reused = N - seq.num_recompute_tokens
+                num_batched_tokens += len(seq) - reused
+            else:
+                num_batched_tokens += len(seq)
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)

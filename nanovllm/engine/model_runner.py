@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.encoder_cache_manager import EncoderCacheManager
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
@@ -120,10 +121,10 @@ class ModelRunner:
         num_encoder_blocks = int(encoder_memory) // encoder_block_bytes
         assert num_encoder_blocks > 0
         self.encoder_cache_manager = EncoderCacheManager(
-            num_encoder_blocks, 
-            self.block_size, 
-            hf_config.hidden_size, 
-            hf_config.torch_dtype, 
+            num_encoder_blocks,
+            self.block_size,
+            hf_config.hidden_size,
+            hf_config.torch_dtype,
             device="cuda"
         )
         config.num_kvcache_blocks = int(kv_memory) // kv_block_bytes
@@ -135,6 +136,34 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+    def _compute_slots(self, block_table: list[int], start_pos: int, end_pos: int) -> list[int]:
+        """Compute cache slot indices for token positions [start_pos, end_pos)."""
+        slots = []
+        for p in range(start_pos, end_pos):
+            block_idx = p // self.block_size
+            offset = p % self.block_size
+            slot = block_table[block_idx] * self.block_size + offset
+            slots.append(slot)
+        return slots
+
+    @torch.inference_mode()
+    def copy_image_kv(self, old_slots: list[int], new_slots: list[int]):
+        """Copy reused image KV from old cache positions to new cache positions."""
+        if not old_slots:
+            return
+        old_t = torch.tensor(old_slots, dtype=torch.long, device='cuda')
+        new_t = torch.tensor(new_slots, dtype=torch.long, device='cuda')
+        # kv_cache: [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        shape = self.kv_cache.shape
+        flat = self.kv_cache.view(shape[0], shape[1], -1, shape[4] * shape[5])
+        flat[:, :, new_t] = flat[:, :, old_t]
+
+    def _prepare_block_tables_for_virtual_seqs(self, virtual_block_tables: list[list[int]]):
+        """Prepare block_tables tensor for virtual sub-sequences."""
+        max_len = max(len(bt) for bt in virtual_block_tables)
+        padded = [bt + [-1] * (max_len - len(bt)) for bt in virtual_block_tables]
+        return torch.tensor(padded, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -150,52 +179,100 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
-        block_tables = None
         mm_inputs = {"pixel_values": [], "image_grid_thw": [], "image_hashes": []}
         has_multimodal = False
+        has_partial_recompute = False
+        virtual_block_tables = []  # one row per virtual sub-sequence
+        num_recompute_image_tokens = 0  # total recompute image tokens across batch
+        # Track which virtual sub-seq indices produce real sequence outputs
+        # (ParallelLMHead outputs one logit per cu_seqlens_q entry)
+        logit_indices = []  # indices into the logits output to keep
+        virtual_seq_idx = 0
+
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
-            seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+
             if seq.mm_inputs:
                 has_multimodal = True
-                image_token_id = getattr(self.model.config, "image_token_id", 151655)
-                num_cached_images = seq.token_ids[:seq.num_cached_tokens].count(image_token_id)
                 pv = seq.mm_inputs.get("pixel_values")
                 g_thw = seq.mm_inputs.get("image_grid_thw")
                 hashes = seq.image_hashes
-                if num_cached_images > 0:
-                    if g_thw is not None:
-                        img_lens = (g_thw[:, 0] * g_thw[:, 1] * g_thw[:, 2]).tolist()
-                        pv_offset = sum(img_lens[:num_cached_images])
-                        if pv is not None:
-                            pv = pv[pv_offset:]
-                        g_thw = g_thw[num_cached_images:]
-                    if hashes:
-                        hashes = hashes[num_cached_images:]
                 if pv is not None:
                     mm_inputs["pixel_values"].append(pv)
                 if g_thw is not None:
                     mm_inputs["image_grid_thw"].append(g_thw)
                 if hashes:
                     mm_inputs["image_hashes"].extend(hashes)
-            if not seq.block_table:    # warmup
-                continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+
+            if seq.is_partial_recompute:
+                has_partial_recompute = True
+                img_start, img_end = seq.image_token_range
+                R = seq.num_recompute_tokens
+
+                # Sub-seq 1: text_before + first R image tokens
+                # Q = tokens[0 : img_start + R], K = tokens[0 : img_start + R]
+                sub1_tokens = seq.token_ids[0: img_start + R]
+                sub1_positions = list(range(0, img_start + R))
+                seqlen_q1 = img_start + R
+                seqlen_k1 = img_start + R
+
+                # Sub-seq 2: text after image
+                # Q = tokens[img_end : seqlen], K = tokens[0 : seqlen] (full)
+                sub2_tokens = seq.token_ids[img_end: seqlen]
+                sub2_positions = list(range(img_end, seqlen))
+                seqlen_q2 = seqlen - img_end
+                seqlen_k2 = seqlen
+
+                input_ids.extend(sub1_tokens)
+                input_ids.extend(sub2_tokens)
+                positions.extend(sub1_positions)
+                positions.extend(sub2_positions)
+
+                cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q1)
+                cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k1)
+                cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q2)
+                cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k2)
+                max_seqlen_q = max(max_seqlen_q, seqlen_q1, seqlen_q2)
+                max_seqlen_k = max(max_seqlen_k, seqlen_k1, seqlen_k2)
+
+                # Slot mapping for sub-seq 1: all tokens [0, img_start + R)
+                if seq.block_table:
+                    slot_mapping.extend(self._compute_slots(seq.block_table, 0, img_start + R))
+                    # Slot mapping for sub-seq 2: text after image [img_end, seqlen)
+                    slot_mapping.extend(self._compute_slots(seq.block_table, img_end, seqlen))
+
+                    # Both virtual sub-sequences share the same block table
+                    virtual_block_tables.append(list(seq.block_table))
+                    virtual_block_tables.append(list(seq.block_table))
+
+                num_recompute_image_tokens += R
+                # Sub-seq 1 logit (recomputed image last token) - skip
+                # Sub-seq 2 logit (text_after last token) - keep
+                logit_indices.append(virtual_seq_idx + 1)
+                virtual_seq_idx += 2
+
+            else:
+                # Normal sequence: compute all tokens (no prefix cache)
+                input_ids.extend(seq.token_ids)
+                positions.extend(list(range(seqlen)))
+                seqlen_q = seqlen
+                seqlen_k = seqlen
+                cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+                cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+                max_seqlen_q = max(seqlen_q, max_seqlen_q)
+                max_seqlen_k = max(seqlen_k, max_seqlen_k)
+                if seq.block_table:
+                    slot_mapping.extend(self._compute_slots(seq.block_table, 0, seqlen))
+                    virtual_block_tables.append(list(seq.block_table))
+                logit_indices.append(virtual_seq_idx)
+                virtual_seq_idx += 1
+
+        # Build block_tables tensor
+        block_tables = None
+        if has_partial_recompute and virtual_block_tables:
+            # When any sequence has partial recompute, we need block_tables
+            # because sub-seq 2 reads reused image KV from cache
+            block_tables = self._prepare_block_tables_for_virtual_seqs(virtual_block_tables)
 
         if has_multimodal:
             for key in ["pixel_values", "image_grid_thw"]:
@@ -203,6 +280,8 @@ class ModelRunner:
                     mm_inputs[key] = torch.cat(mm_inputs[key], dim=0).cuda(non_blocking=True)
                 else:
                     mm_inputs.pop(key, None)
+            if num_recompute_image_tokens > 0:
+                mm_inputs["_num_recompute_image_tokens"] = num_recompute_image_tokens
         else:
             mm_inputs = None
 
@@ -212,6 +291,8 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        # Store logit filter indices for partial recompute
+        self._logit_indices = logit_indices if has_partial_recompute else None
         return input_ids, positions, mm_inputs
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -289,7 +370,16 @@ class ModelRunner:
                 if self.encoder_cache_manager.can_allocate(out_len):
                     block_ids = self.encoder_cache_manager.allocate(h, out_len)
                     self.encoder_cache_manager.write(block_ids, emb)
-        return torch.cat(image_embeds_list, dim=0), vit_time
+
+        visual_embeds = torch.cat(image_embeds_list, dim=0)
+
+        # Slice visual embeddings for partial recompute:
+        # only keep first R embeddings per image (input_ids only has R image tokens)
+        num_recompute = mm_inputs.get("_num_recompute_image_tokens")
+        if num_recompute is not None and num_recompute > 0:
+            visual_embeds = visual_embeds[:num_recompute]
+
+        return visual_embeds, vit_time
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, mm_inputs: dict = None):
@@ -325,7 +415,13 @@ class ModelRunner:
             mm_inputs = None
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits, vit_time = self.run_model(input_ids, positions, is_prefill, mm_inputs)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if self.rank == 0:
+            # Filter logits for partial recompute: keep only real sequence outputs
+            if is_prefill and self._logit_indices is not None:
+                logits = logits[self._logit_indices]
+            token_ids = self.sampler(logits, temperatures).tolist()
+        else:
+            token_ids = None
         reset_context()
         return token_ids, vit_time
 
