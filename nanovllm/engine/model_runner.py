@@ -39,6 +39,8 @@ class ModelRunner:
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
+        if hasattr(self.model, 'visual'):
+            self.warmup_visual()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -102,6 +104,24 @@ class ModelRunner:
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
+        torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def warmup_visual(self):
+        """Warmup VIT with a dummy image to trigger CUDA kernel compilation."""
+        visual = self.model.visual
+        sms = visual.spatial_merge_size
+        ps = visual.patch_size
+        pe = visual.patch_embed
+        tps = pe.temporal_patch_size
+        in_ch = pe.in_channels
+        # Minimal image: 1 temporal frame, smallest spatial grid that satisfies merge
+        t, h_patches, w_patches = 1, sms, sms
+        num_patches = t * h_patches * w_patches
+        dummy_pixels = torch.zeros(num_patches, in_ch * tps * ps * ps,
+                                   device='cuda', dtype=visual.dtype)
+        dummy_thw = torch.tensor([[t, h_patches, w_patches]], device='cuda', dtype=torch.long)
+        visual(dummy_pixels, dummy_thw)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -183,7 +203,7 @@ class ModelRunner:
         has_multimodal = False
         has_partial_recompute = False
         virtual_block_tables = []  # one row per virtual sub-sequence
-        num_recompute_image_tokens = 0  # total recompute image tokens across batch
+        image_recompute_counts = []  # per-image: R tokens to keep (0 = keep all)
         # Track which virtual sub-seq indices produce real sequence outputs
         # (ParallelLMHead outputs one logit per cu_seqlens_q entry)
         logit_indices = []  # indices into the logits output to keep
@@ -201,6 +221,11 @@ class ModelRunner:
                     mm_inputs["pixel_values"].append(pv)
                 if g_thw is not None:
                     mm_inputs["image_grid_thw"].append(g_thw)
+                    for _ in range(g_thw.shape[0]):
+                        if seq.is_partial_recompute and seq.num_recompute_tokens > 0:
+                            image_recompute_counts.append(seq.num_recompute_tokens)
+                        else:
+                            image_recompute_counts.append(0)
                 if hashes:
                     mm_inputs["image_hashes"].extend(hashes)
 
@@ -245,7 +270,6 @@ class ModelRunner:
                     virtual_block_tables.append(list(seq.block_table))
                     virtual_block_tables.append(list(seq.block_table))
 
-                num_recompute_image_tokens += R
                 # Sub-seq 1 logit (recomputed image last token) - skip
                 # Sub-seq 2 logit (text_after last token) - keep
                 logit_indices.append(virtual_seq_idx + 1)
@@ -280,8 +304,8 @@ class ModelRunner:
                     mm_inputs[key] = torch.cat(mm_inputs[key], dim=0).cuda(non_blocking=True)
                 else:
                     mm_inputs.pop(key, None)
-            if num_recompute_image_tokens > 0:
-                mm_inputs["_num_recompute_image_tokens"] = num_recompute_image_tokens
+            if any(r > 0 for r in image_recompute_counts):
+                mm_inputs["_image_recompute_counts"] = image_recompute_counts
         else:
             mm_inputs = None
 
@@ -371,14 +395,14 @@ class ModelRunner:
                     block_ids = self.encoder_cache_manager.allocate(h, out_len)
                     self.encoder_cache_manager.write(block_ids, emb)
 
+        # For partial recompute: only keep first R embeddings per image
+        recompute_counts = mm_inputs.get("_image_recompute_counts")
+        if recompute_counts is not None:
+            for i, r in enumerate(recompute_counts):
+                if r > 0:
+                    image_embeds_list[i] = image_embeds_list[i][:r]
+
         visual_embeds = torch.cat(image_embeds_list, dim=0)
-
-        # Slice visual embeddings for partial recompute:
-        # only keep first R embeddings per image (input_ids only has R image tokens)
-        num_recompute = mm_inputs.get("_num_recompute_image_tokens")
-        if num_recompute is not None and num_recompute > 0:
-            visual_embeds = visual_embeds[:num_recompute]
-
         return visual_embeds, vit_time
 
     @torch.inference_mode()

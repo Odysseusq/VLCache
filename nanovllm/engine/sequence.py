@@ -99,6 +99,11 @@ class Sequence:
         if start != -1:
             self.image_token_range = (start, end)
 
+    def reset_partial_recompute(self):
+        self.image_token_range = None
+        self.num_recompute_tokens = 0
+        self.is_partial_recompute = False
+
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
@@ -111,9 +116,7 @@ class Sequence:
                 self.image_token_range, self.num_recompute_tokens, self.is_partial_recompute)
 
     def __setstate__(self, state):
-        self.image_token_range = None
-        self.num_recompute_tokens = 0
-        self.is_partial_recompute = False
+        self.reset_partial_recompute()
         if len(state) == 13:
             self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft, self.image_hashes, self.image_token_range, self.num_recompute_tokens, self.is_partial_recompute = state
         elif len(state) == 10:
