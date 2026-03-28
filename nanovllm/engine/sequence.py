@@ -30,7 +30,12 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.mm_inputs = mm_inputs
         self.image_hashes = image_hashes
-        
+
+        # Partial recompute fields
+        self.image_token_range: tuple[int, int] | None = None
+        self.num_recompute_tokens: int = 0
+        self.is_partial_recompute: bool = False
+
         # Timing metrics
         self.start_time = time.time()
         self.vit_time = 0.0
@@ -83,6 +88,22 @@ class Sequence:
             h ^= x
         return h
 
+    def find_image_token_range(self, image_token_id: int = 151655):
+        """Find contiguous range of image tokens. Single image only."""
+        start = end = -1
+        for i, tid in enumerate(self.token_ids):
+            if tid == image_token_id:
+                if start == -1:
+                    start = i
+                end = i + 1
+        if start != -1:
+            self.image_token_range = (start, end)
+
+    def reset_partial_recompute(self):
+        self.image_token_range = None
+        self.num_recompute_tokens = 0
+        self.is_partial_recompute = False
+
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
@@ -91,16 +112,19 @@ class Sequence:
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token,
-                self.mm_inputs, self.start_time, self.vit_time, self.ttft, self.image_hashes)
+                self.mm_inputs, self.start_time, self.vit_time, self.ttft, self.image_hashes,
+                self.image_token_range, self.num_recompute_tokens, self.is_partial_recompute)
 
     def __setstate__(self, state):
-        if len(state) == 10:
+        self.reset_partial_recompute()
+        if len(state) == 13:
+            self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft, self.image_hashes, self.image_token_range, self.num_recompute_tokens, self.is_partial_recompute = state
+        elif len(state) == 10:
             self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft, self.image_hashes = state
         elif len(state) == 9:
             self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft = state
             self.image_hashes = None
         else:
-            # Backward compatibility
             self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.mm_inputs = state
             self.start_time = time.time()
             self.vit_time = 0.0

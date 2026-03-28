@@ -55,8 +55,56 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params, mm_inputs, image_hashes)
         self.scheduler.add(seq)
 
+    def _do_image_kv_copy(self, seqs: list[Sequence]):
+        """Copy reused image KV cache from old blocks to new blocks for partial recompute sequences."""
+        block_manager = self.scheduler.block_manager
+        block_size = block_manager.block_size
+        for seq in seqs:
+            if not seq.is_partial_recompute:
+                continue
+            image_hash = seq.image_hashes[0]
+            entry = block_manager.get_image_kv_entry(image_hash)
+            if entry is None:
+                continue
+            img_start, img_end = seq.image_token_range
+            R = seq.num_recompute_tokens
+            reuse_start = img_start + R
+            reuse_end = img_end
+            if reuse_start >= reuse_end:
+                continue
+            # Compute old slots (source: from stored image KV entry)
+            old_slots = []
+            for p in range(reuse_start, reuse_end):
+                # Old sequence had image at same relative positions
+                old_p = entry.img_start + (p - img_start)
+                block_idx = old_p // block_size
+                offset = old_p % block_size
+                old_slots.append(entry.block_table[block_idx] * block_size + offset)
+            # Compute new slots (destination: new sequence's blocks)
+            new_slots = []
+            for p in range(reuse_start, reuse_end):
+                block_idx = p // block_size
+                offset = p % block_size
+                new_slots.append(seq.block_table[block_idx] * block_size + offset)
+            self.model_runner.call("copy_image_kv", old_slots, new_slots)
+
+    def _store_image_kv(self, seqs: list[Sequence]):
+        """Store image KV block info after prefill for future reuse."""
+        block_manager = self.scheduler.block_manager
+        image_token_id = self.scheduler.image_token_id
+        for seq in seqs:
+            if not seq.image_hashes or not seq.block_table:
+                continue
+            if seq.image_token_range is None:
+                seq.find_image_token_range(image_token_id)
+            if seq.image_token_range is not None:
+                block_manager.store_image_kv(seq)
+
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        if is_prefill:
+            # Copy reused image KV before model forward pass
+            self._do_image_kv_copy(seqs)
         token_ids, vit_time = self.model_runner.call("run", seqs, is_prefill)
         if is_prefill:
             now = time()
@@ -64,6 +112,8 @@ class LLMEngine:
                 if seq.mm_inputs:
                     seq.vit_time = vit_time
                 seq.ttft = now - seq.start_time
+            # Store image KV for future reuse
+            self._store_image_kv(seqs)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [seq for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)

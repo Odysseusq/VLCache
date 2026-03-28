@@ -43,6 +43,52 @@ The primary and production-ready implementation of VLCache is built on **SGLang*
 - Dynamic recomputation strategies.
 - Integration with Qwen2.5-VL models.
 
+## 🧪 Benchmarking Partial KV Cache Recompute
+
+The script **`test_partial_recompute.py`** is the main entry point for benchmarking the partial KV cache recompute feature. It measures the TTFT (Time To First Token) improvement when reusing image KV cache across requests with the same image but different text prompts.
+
+### What it does
+
+1. **Generates a 4K test image** (3840×2160) in `assets/test_4k.png` if it doesn't exist.
+2. **Runs two phases** in isolated subprocesses (to ensure clean GPU state):
+   - **Phase 1 — Baseline** (`recompute_ratio=0.0`): Full recomputation of all image tokens on every request.
+   - **Phase 2 — Partial Recompute** (`recompute_ratio=0.1`): Recomputes only the first 10% of image tokens and reuses the remaining 90% from cache.
+3. Each phase sends **two requests** with the same image but different prompts:
+   - **Request 1 (cold)**: Populates the image KV cache.
+   - **Request 2 (warm)**: Reuses cached image KV (partial recompute kicks in here).
+4. **Compares warm TTFT** between baseline and partial recompute, reporting speedup.
+
+### Usage
+
+```bash
+python test_partial_recompute.py
+```
+
+> **Note**: The model path defaults to `/opt/tiger/vlcache/model_vl_3b`. Edit `MODEL_PATH` in the script to point to your local Qwen2.5-VL-3B checkpoint.
+
+### Configuration
+
+The key parameter is `recompute_ratio` (set in `nanovllm/config.py`):
+- `0.0` — Baseline, no cache reuse (full recompute every time).
+- `0.1` — Recompute 10% of image tokens, reuse 90%. This is the default test setting.
+- `1.0` — Recompute all image tokens (equivalent to baseline).
+
+### Expected output
+
+```
+Phase 1: Baseline  (recompute_ratio=0.0)
+  [Req 1 cold] TTFT:   XXX.X ms  VIT: XX.X ms
+  [Req 2 warm] TTFT:   XXX.X ms  VIT: XX.X ms
+
+Phase 2: Partial recompute  (recompute_ratio=0.1)
+  [Req 1 cold] TTFT:   XXX.X ms  VIT: XX.X ms
+  [Req 2 warm] TTFT:    XX.X ms  VIT: XX.X ms
+
+Summary
+  Req2 warm speedup: X.XXx  (+XXX.X ms)
+  PASS: Partial recompute significantly reduces warm TTFT
+```
+
 ## 🔗 Citation
 
 If you find this work useful, please cite our paper:
